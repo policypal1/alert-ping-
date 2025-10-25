@@ -1,56 +1,59 @@
-export default async function handler(req, res) {
+// CommonJS for Vercel Node functions
+module.exports = async (req, res) => {
+  // CORS (harmless for GET pixel; useful if you keep POST tests)
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
-  const ua = req.headers['user-agent'] || 'unknown';
+  const webhook = process.env.DISCORD_WEBHOOK_URL; // <-- keep your existing env var
+  if (!webhook) return res.status(500).send('Missing DISCORD_WEBHOOK_URL');
+
+  // --- Collect request data ---
+  const ua = req.headers['user-agent'] || '';
   const ip =
-    req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
     req.socket?.remoteAddress ||
     'unknown';
 
   // --- Parse device ---
-  let device = 'Unknown Device';
+  let device = 'PC';
   if (/mobile|android|iphone|ipad|ipod/i.test(ua)) {
     if (/android/i.test(ua)) device = 'Android';
     else if (/iphone|ipad|ipod/i.test(ua)) device = 'iPhone';
     else device = 'Mobile';
-  } else {
-    device = 'PC';
   }
 
-  // --- Parse browser ---
+  // --- Parse browser (simple) ---
   let browser = 'Unknown';
-  if (/chrome|crios/i.test(ua)) browser = 'Chrome';
-  else if (/safari/i.test(ua) && !/chrome|crios/i.test(ua)) browser = 'Safari';
+  if (/edg/i.test(ua)) browser = 'Edge';
+  else if (/opr|opera/i.test(ua)) browser = 'Opera';
   else if (/firefox|fxios/i.test(ua)) browser = 'Firefox';
-  else if (/edg/i.test(ua)) browser = 'Edge';
-  else if (/opera|opr/i.test(ua)) browser = 'Opera';
+  else if (/chrome|crios/i.test(ua)) browser = 'Chrome';
+  else if (/safari/i.test(ua)) browser = 'Safari';
 
-  // --- Oregon time ---
-  const now = new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
+  // --- Oregon time (Pacific) ---
+  const now = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    dateStyle: 'short',
+    timeStyle: 'medium'
+  }).format(new Date());
 
-  // --- Discord webhook ---
-  const webhook = process.env.WEBHOOK_URL; // or paste your webhook directly here if you prefer
-  if (!webhook) return res.status(400).send('Webhook not set');
-
-  const embed = {
-    title: '👀 New Page View',
-    color: 0x57f287,
-    fields: [
-      { name: '🕒 Time', value: now, inline: false },
-      { name: '💻 Device', value: `${device}`, inline: true },
-      { name: '🌐 Browser', value: `${browser}`, inline: true },
-      { name: '📍 IP', value: ip, inline: false }
-    ],
-  };
+  // --- Send to Discord (clean text, no raw UA, no path/ref) ---
+  const content =
+    `👀 **New Visit**\n` +
+    `**Time:** ${now} (Oregon)\n` +
+    `**Device:** ${device}\n` +
+    `**Browser:** ${browser}\n` +
+    `**IP:** ${ip}`;
 
   await fetch(webhook, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ embeds: [embed] }),
+    body: JSON.stringify({ content })
   });
 
-  res.status(200).json({ ok: true });
-}
+  // Browser-friendly responses
+  if (req.method === 'GET') return res.status(200).send('ok');
+  return res.status(204).end();
+};
