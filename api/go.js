@@ -1,4 +1,4 @@
-// /api/go.js  — minimal + reliable
+// api/go.js  — minimal + reliable, with simple dedupe per-warm-instance
 module.exports = async (req, res) => {
   try {
     const webhook = process.env.DISCORD_WEBHOOK_URL;
@@ -11,6 +11,21 @@ module.exports = async (req, res) => {
       req.socket?.remoteAddress ||
       'unknown';
     const ref = req.headers['referer'] || 'none';
+
+    // tiny dedupe to prevent multiple near-identical "tracked link clicked" messages
+    const DEDUPE_MS = 2000;
+    if (!global.__go_dedupe) global.__go_dedupe = new Map();
+    const key = `${ip}|${ua}|${dest}`;
+    const now = Date.now();
+    const last = global.__go_dedupe.get(key);
+    if (last && (now - last) < DEDUPE_MS) {
+      // skip sending duplicate webhook — still redirect
+      res.writeHead(302, { Location: dest });
+      return res.end();
+    }
+    global.__go_dedupe.set(key, now);
+    // GC
+    for (const [k, t] of global.__go_dedupe) if (now - t > DEDUPE_MS * 10) global.__go_dedupe.delete(k);
 
     if (!webhook) {
       console.error('Missing DISCORD_WEBHOOK_URL');
@@ -34,7 +49,7 @@ module.exports = async (req, res) => {
     res.writeHead(302, { Location: dest });
     res.end();
   } catch (e) {
-    console.error(e);
+    console.error(e && e.stack || e);
     res.status(500).send('Server error.');
   }
 };
