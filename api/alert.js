@@ -1,5 +1,5 @@
 // api/alert.js — Vercel Serverless Function (CommonJS, Node 18+)
-// Sends a compact, high-signal Discord alert. Works with your pixel + rich POST collector.
+// Sends a compact, high-signal Discord alert with simple in-memory de-dup.
 
 module.exports = async (req, res) => {
   // --- CORS (safe for GET pixel; handy for POST tests)
@@ -10,6 +10,12 @@ module.exports = async (req, res) => {
 
   const webhook = process.env.DISCORD_WEBHOOK_URL;
   if (!webhook) return res.status(500).send('Missing DISCORD_WEBHOOK_URL');
+
+  // ---------- small in-memory dedupe (works per warm instance) ----------
+  // Keyed by IP + device + browser + path — throttles repeated identical alerts
+  const DEDUPE_WINDOW_MS = 5000; // 5 seconds
+  if (!global.__alert_dedupe) global.__alert_dedupe = new Map();
+  const dedupeMap = global.__alert_dedupe;
 
   // ---------- helpers ----------
   const parseUA = (ua = '') => {
@@ -34,12 +40,6 @@ module.exports = async (req, res) => {
     return { browser, os, device };
   };
 
-  const oregonNow = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/Los_Angeles',
-    dateStyle: 'short',
-    timeStyle: 'medium'
-  }).format(new Date());
-
   const pick = (v, d = null) => (v === undefined ? d : v);
 
   // ---------- request basics ----------
@@ -49,7 +49,7 @@ module.exports = async (req, res) => {
     req.socket?.remoteAddress || 'unknown';
   const refHeader = req.headers['referer'] || 'none';
 
-  // Vercel geo headers
+  // Vercel geo headers (may be empty)
   const city      = req.headers['x-vercel-ip-city'] || '';
   const region    = req.headers['x-vercel-ip-country-region'] || req.headers['x-vercel-ip-region'] || '';
   const country   = (req.headers['x-vercel-ip-country'] || '').toUpperCase();
@@ -90,13 +90,51 @@ module.exports = async (req, res) => {
     ref: pick(body.ref, q.ref || refHeader) || 'none'
   };
 
-  // location formatting
-  const flag = country ? String.fromCodePoint(...[...country].map(c => 0x1F1A5 + c.charCodeAt(0))) : '';
+  // location formatting — fixed flag construction
+  const flag = country
+    ? (() => {
+        // country is expected like 'US' — construct regional indicator symbols correctly
+        try {
+          const chars = [...country].map(c => 0x1F1E6 + (c.charCodeAt(0) - 65));
+          return String.fromCodePoint(...chars);
+        } catch {
+          return '';
+        }
+      })()
+    : '';
   const approxLoc = (city || region || country)
     ? `${city ? city + ', ' : ''}${region ? region + ', ' : ''}${country}${flag ? ' ' + flag : ''}`
     : 'Unknown';
 
+  // ---------- dedupe decision ----------
+  const dedupeKey = `${ip}|${client.device}|${client.browser}|${client.path}`;
+  const now = Date.now();
+  const last = dedupeMap.get(dedupeKey);
+  if (last && (now - last) < DEDUPE_WINDOW_MS) {
+    // Rapid duplicate — skip sending another alert from this warm instance.
+    // Update last timestamp so the window slides a bit (prevents a storm).
+    dedupeMap.set(dedupeKey, now);
+    // Respond quickly. Pixel clients expect 200 on GET or 204 on POST; maintain behavior.
+    if (req.method === 'GET') return res.status(200).send('ok');
+    return res.status(204).end();
+  }
+  // record send time
+  dedupeMap.set(dedupeKey, now);
+
+  // Garbage-collect dedupeMap entries older than (window * 10) to avoid memory leak
+  try {
+    for (const [k, t] of dedupeMap) {
+      if (now - t > DEDUPE_WINDOW_MS * 10) dedupeMap.delete(k);
+    }
+  } catch (e) { /* non-fatal */ }
+
   // ---------- COMPACT, SCANNABLE MESSAGE ----------
+  const oregonNow = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    dateStyle: 'short',
+    timeStyle: 'medium'
+  }).format(new Date());
+
   const lines = [
     `🆕 **New Visit**`,
     `🕒 ${oregonNow}`,
@@ -115,11 +153,17 @@ module.exports = async (req, res) => {
     `🧭 Path: ${client.path || '/'}`
   ].filter(Boolean);
 
-  await fetch(webhook, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content: lines.join('\n') })
-  });
+  // send safely
+  try {
+    await fetch(webhook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: lines.join('\n') })
+    });
+  } catch (err) {
+    console.error('Alert webhook send error:', err && err.stack || err);
+    // continue — don't break pixel behavior
+  }
 
   // pixel OK
   if (req.method === 'GET') return res.status(200).send('ok');
