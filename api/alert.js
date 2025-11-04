@@ -1,5 +1,5 @@
 // api/alert.js
-// Minimal, reliable Discord alert endpoint
+// Minimal, reliable Discord alert endpoint for Vercel
 
 module.exports = async (req, res) => {
   // CORS
@@ -8,23 +8,23 @@ module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  // ---- READ WEBHOOK ENV VARIABLE ----
+  // 1) Webhook from Vercel env
   const webhook = process.env.DISCORD_WEBHOOK_URL;
   if (!webhook) {
-    // IMPORTANT: This will SHOW you the error instead of silently failing
+    // Visible error so you notice instantly
     return res
       .status(500)
       .send("❌ ERROR: DISCORD_WEBHOOK_URL is NOT set in Vercel Environment Variables");
   }
 
-  // ---- READ CLIENT PAYLOAD ----
+  // 2) Parse body (POST) or use defaults
   let body = {};
   if (req.method === "POST") {
     try { body = typeof req.body === "object" ? req.body : JSON.parse(req.body || "{}"); }
     catch { body = {}; }
   }
 
-  // ---- REQUEST METADATA ----
+  // 3) Basic request metadata
   const ua = req.headers["user-agent"] || "unknown";
   const ip =
     (req.headers["x-forwarded-for"] || "").split(",")[0]?.trim() ||
@@ -34,8 +34,8 @@ module.exports = async (req, res) => {
   const path = body.path || req.headers["x-pathname"] || req.url || "/";
   const name = body.name || "Unknown Tester";
 
-  // ---- CORE MESSAGE ----
-  const message = [
+  // 4) Compose a human-friendly message (kept < 2000 chars)
+  const lines = [
     `**New Visit Alert**`,
     `👤 Name: ${name}`,
     `🌐 IP: ${ip}`,
@@ -56,24 +56,21 @@ module.exports = async (req, res) => {
         : "unknown"
     }`,
     ``,
-    `🎮 GPU: ${
-      body.gpu
-        ? `${body.gpu.renderer || body.gpu.vendor}`
-        : "unknown"
-    }`,
-  ].join("\n");
+    `🎮 GPU: ${body.gpu ? (body.gpu.renderer || body.gpu.vendor) : "unknown"}`
+  ];
+  const message = lines.join("\n").slice(0, 1900); // hard cap for Discord safety
 
-  // ---- SEND TO DISCORD ----
+  // 5) Send to Discord
   try {
     await fetch(webhook, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: message }),
+      body: JSON.stringify({ content: message })
     });
   } catch (err) {
     return res.status(500).send("❌ Failed to send to Discord: " + String(err));
   }
 
-  // ---- RESPONSE BACK TO CLIENT ----
+  // 6) Respond to browser
   return res.status(204).end();
 };
