@@ -1,8 +1,9 @@
-// api/alert.js — Vercel Serverless Function (CommonJS, Node 18+)
-// Sends a compact, high-signal Discord alert with simple in-memory de-dup.
+// api/alert.js
+// Debounced aggregator: collects multiple near-identical hits and sends one clear Discord message.
+// Per-warm-instance in-memory solution (fast, no external infra). For cross-instance dedupe use Redis.
 
 module.exports = async (req, res) => {
-  // --- CORS (safe for GET pixel; handy for POST tests)
+  // --- CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -11,13 +12,16 @@ module.exports = async (req, res) => {
   const webhook = process.env.DISCORD_WEBHOOK_URL;
   if (!webhook) return res.status(500).send('Missing DISCORD_WEBHOOK_URL');
 
-  // ---------- small in-memory dedupe (works per warm instance) ----------
-  // Keyed by IP + device + browser + path — throttles repeated identical alerts
-  const DEDUPE_WINDOW_MS = 5000; // 5 seconds
-  if (!global.__alert_dedupe) global.__alert_dedupe = new Map();
-  const dedupeMap = global.__alert_dedupe;
+  // -------------------- config --------------------
+  const AGGREGATE_WINDOW_MS = 3000; // collect hits for this key for 3s before sending aggregated alert
+  const DEDUPE_HOLD_MS = 12_000;    // keep a recent entry around for this long to avoid re-alerting immediately
+  const MAX_JSON_SNIPPET = 1500;    // trim raw JSON debug to this many chars to keep webhook friendly
 
-  // ---------- helpers ----------
+  // -------------------- in-memory store --------------------
+  if (!global.__alert_agg) global.__alert_agg = new Map(); // key -> {count, firstTs, lastPayload, timer}
+  const store = global.__alert_agg;
+
+  // -------------------- helpers --------------------
   const parseUA = (ua = '') => {
     let browser = 'Unknown';
     if (/edg/i.test(ua)) browser = 'Edge';
@@ -40,23 +44,22 @@ module.exports = async (req, res) => {
     return { browser, os, device };
   };
 
-  const pick = (v, d = null) => (v === undefined ? d : v);
+  const safeJson = (o) => {
+    try { return JSON.stringify(o, null, 2); } catch { return String(o); }
+  };
 
-  // ---------- request basics ----------
+  const trimStr = (s, n) => (s && s.length > n ? s.slice(0, n - 150) + '\n\n...trimmed...' : s);
+
+  // -------------------- build request info --------------------
   const ua = req.headers['user-agent'] || '';
+  const uaParsed = parseUA(ua);
+
   const ip =
-    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
-    req.socket?.remoteAddress || 'unknown';
+    (req.headers['x-forwarded-for'] || '').split(',')[0]?.trim() ||
+    req.socket?.remoteAddress ||
+    'unknown';
+
   const refHeader = req.headers['referer'] || 'none';
-
-  // Vercel geo headers (may be empty)
-  const city      = req.headers['x-vercel-ip-city'] || '';
-  const region    = req.headers['x-vercel-ip-country-region'] || req.headers['x-vercel-ip-region'] || '';
-  const country   = (req.headers['x-vercel-ip-country'] || '').toUpperCase();
-  const latitude  = req.headers['x-vercel-ip-latitude'] || '';
-  const longitude = req.headers['x-vercel-ip-longitude'] || '';
-
-  // queries + body
   const q = req.query || {};
   let body = {};
   if (req.method === 'POST') {
@@ -65,107 +68,156 @@ module.exports = async (req, res) => {
     } catch { body = {}; }
   }
 
-  // ---------- merge client/server values ----------
-  const uaParsed = parseUA(ua);
+  // client-provided id (optional) — use if you set it in the page (helps dedupe across instances)
+  const clickId = body.click_id || q.click_id || req.headers['x-click-id'] || null;
 
   const client = {
-    fpHash: pick(body.fpHash, null),
-    browser: pick(body.browser, uaParsed.browser),
-    os: pick(body.os, uaParsed.os),
-    device: pick(body.device, uaParsed.device),
-
-    language: pick(body.language, (req.headers['accept-language']||'').split(',')[0] || 'unknown'),
-    timezone: pick(body.timezone, q.tz || null),
-
-    // rich extras (may be null if your page only sent the pixel)
-    gpu: pick(body.gpu, null),
-    net: pick(body.net, null),
-    hw: pick(body.hw, null),
-    screen: pick(body.screen, null),
-    battery: pick(body.battery, null),
-    color: pick(body.color, null),
-
-    // routing
-    path: (pick(body.path, q.path || '') || '').toString().slice(0, 512),
-    ref: pick(body.ref, q.ref || refHeader) || 'none'
+    fpHash: body.fpHash ?? null,
+    browser: body.browser ?? uaParsed.browser,
+    os: body.os ?? uaParsed.os,
+    device: body.device ?? uaParsed.device,
+    language: body.language ?? (req.headers['accept-language']||'').split(',')[0] || 'unknown',
+    timezone: body.timezone ?? q.tz ?? null,
+    gpu: body.gpu ?? null,
+    net: body.net ?? null,
+    hw: body.hw ?? null,
+    screen: body.screen ?? null,
+    battery: body.battery ?? null,
+    color: body.color ?? null,
+    path: (body.path ?? q.path ?? req.headers['x-pathname'] ?? '/').toString().slice(0, 512),
+    ref: body.ref ?? q.ref ?? refHeader ?? 'none'
   };
 
-  // location formatting — fixed flag construction
+  // Vercel geo headers (may be empty)
+  const city      = req.headers['x-vercel-ip-city'] || '';
+  const region    = req.headers['x-vercel-ip-country-region'] || req.headers['x-vercel-ip-region'] || '';
+  const country   = (req.headers['x-vercel-ip-country'] || '').toUpperCase();
+  const latitude  = req.headers['x-vercel-ip-latitude'] || '';
+  const longitude = req.headers['x-vercel-ip-longitude'] || '';
+
+  // construct flag safely (US -> 🇺🇸)
   const flag = country
     ? (() => {
-        // country is expected like 'US' — construct regional indicator symbols correctly
         try {
           const chars = [...country].map(c => 0x1F1E6 + (c.charCodeAt(0) - 65));
           return String.fromCodePoint(...chars);
-        } catch {
-          return '';
-        }
+        } catch { return ''; }
       })()
     : '';
+
   const approxLoc = (city || region || country)
     ? `${city ? city + ', ' : ''}${region ? region + ', ' : ''}${country}${flag ? ' ' + flag : ''}`
     : 'Unknown';
 
-  // ---------- dedupe decision ----------
-  const dedupeKey = `${ip}|${client.device}|${client.browser}|${client.path}`;
+  // -------------------- dedupe key --------------------
+  // Use IP + device + browser + path + optional fpHash + optional clickId
+  const keyParts = [ip, client.device || '-', client.browser || '-', client.path || '/'];
+  if (client.fpHash) keyParts.push(String(client.fpHash).slice(0,12));
+  if (clickId) keyParts.push(String(clickId));
+  const dedupeKey = keyParts.join('|');
+
   const now = Date.now();
-  const last = dedupeMap.get(dedupeKey);
-  if (last && (now - last) < DEDUPE_WINDOW_MS) {
-    // Rapid duplicate — skip sending another alert from this warm instance.
-    // Update last timestamp so the window slides a bit (prevents a storm).
-    dedupeMap.set(dedupeKey, now);
-    // Respond quickly. Pixel clients expect 200 on GET or 204 on POST; maintain behavior.
+
+  // -------------------- aggregator logic --------------------
+  const existing = store.get(dedupeKey);
+  if (existing) {
+    // update existing aggregation entry
+    existing.count += 1;
+    existing.lastTs = now;
+    existing.lastClient = client;
+    existing.lastBody = body;
+    existing.lastHeaders = req.headers;
+
+    // renew timeout: clear previous timer and schedule new send after AGGREGATE_WINDOW_MS from now
+    clearTimeout(existing.timer);
+    existing.timer = setTimeout(() => sendAggregated(dedupeKey), AGGREGATE_WINDOW_MS);
+    // respond immediately to client (pixel friendly)
     if (req.method === 'GET') return res.status(200).send('ok');
     return res.status(204).end();
   }
-  // record send time
-  dedupeMap.set(dedupeKey, now);
 
-  // Garbage-collect dedupeMap entries older than (window * 10) to avoid memory leak
-  try {
-    for (const [k, t] of dedupeMap) {
-      if (now - t > DEDUPE_WINDOW_MS * 10) dedupeMap.delete(k);
-    }
-  } catch (e) { /* non-fatal */ }
+  // create new aggregation entry and schedule send
+  const entry = {
+    count: 1,
+    firstTs: now,
+    lastTs: now,
+    lastClient: client,
+    lastBody: body,
+    lastHeaders: req.headers,
+    timer: null
+  };
+  entry.timer = setTimeout(() => sendAggregated(dedupeKey), AGGREGATE_WINDOW_MS);
+  store.set(dedupeKey, entry);
 
-  // ---------- COMPACT, SCANNABLE MESSAGE ----------
-  const oregonNow = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/Los_Angeles',
-    dateStyle: 'short',
-    timeStyle: 'medium'
-  }).format(new Date());
-
-  const lines = [
-    `🆕 **New Visit**`,
-    `🕒 ${oregonNow}`,
-    `💻 ${client.device} (${client.os}) • 🌐 ${client.browser}`,
-    `📍 ${approxLoc}${latitude && longitude ? ` (${latitude}, ${longitude})` : ''}`,
-    `🔢 IP: ${ip}`,
-    `🧩 Hash: ${client.fpHash ? String(client.fpHash).slice(0, 12) : '—'}`,
-    client.gpu ? `🎮 GPU: ${client.gpu.renderer || client.gpu.vendor || '—'}` : null,
-    client.net ? `📶 Net: ${client.net.type || '—'} • ${client.net.downlink ?? '—'} Mb/s` : null,
-    client.hw ? `⚙️ HW: ${client.hw.cores ?? '—'} cores • ${client.hw.memoryGB ?? '—'} GB` : null,
-    client.screen ? `🖥️ ${client.screen.w}×${client.screen.h} (${client.screen.colorDepth}-bit)` : null,
-    client.battery ? `🔋 ${Math.round((client.battery.level ?? 0)*100)}% • ${client.battery.charging ? '⚡ Charging' : '🔌 Idle'}` : null,
-    `🎨 Mode: ${client.color?.scheme || '—'}`,
-    `⏱️ TZ: ${client.timezone || '—'}`,
-    `🗣️ Lang: ${client.language}`,
-    `🧭 Path: ${client.path || '/'}`
-  ].filter(Boolean);
-
-  // send safely
-  try {
-    await fetch(webhook, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: lines.join('\n') })
-    });
-  } catch (err) {
-    console.error('Alert webhook send error:', err && err.stack || err);
-    // continue — don't break pixel behavior
-  }
-
-  // pixel OK
+  // quick client response
   if (req.method === 'GET') return res.status(200).send('ok');
-  return res.status(204).end();
+  res.status(204).end();
+
+  // -------------------- send function --------------------
+  async function sendAggregated(key) {
+    const item = store.get(key);
+    if (!item) return;
+
+    // Build a plain-language summary
+    const firstTime = new Date(item.firstTs).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
+    const lastTime = new Date(item.lastTs).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
+    const count = item.count;
+    const c = item.lastClient;
+    const h = item.lastHeaders;
+
+    // Pretty human summary for quick scanning
+    const summaryLines = [
+      `🆕 **Visit summary**`,
+      `• **Count (deduped)**: ${count}`,
+      `• **First seen**: ${firstTime}`,
+      `• **Last seen**: ${lastTime}`,
+      `• **Device / OS / Browser**: ${c.device} / ${c.os} / ${c.browser}`,
+      `• **Location (approx)**: ${approxLoc}${latitude && longitude ? ` (${latitude}, ${longitude})` : ''}`,
+      `• **IP**: ${ip}`,
+      `• **Path**: ${c.path || '/'}`,
+      `• **Referrer**: ${c.ref || 'none'}`,
+      `• **FP hash**: ${c.fpHash ? String(c.fpHash).slice(0,12) : '—'}`,
+      `• **Click ID**: ${clickId || '—'}`,
+      `• **Lang / TZ**: ${c.language} / ${c.timezone || '—'}`
+    ];
+
+    // Extra parsed details (optional lines only if present)
+    if (c.gpu) summaryLines.push(`• GPU: ${c.gpu.renderer || c.gpu.vendor || safeJson(c.gpu)}`);
+    if (c.net) summaryLines.push(`• Net: ${c.net.type || '-'} • ${c.net.downlink ?? '-'} Mb/s`);
+    if (c.hw) summaryLines.push(`• HW: ${c.hw.cores ?? '-'} cores • ${c.hw.memoryGB ?? '-'} GB`);
+    if (c.screen) summaryLines.push(`• Screen: ${c.screen.w}×${c.screen.h} (${c.screen.colorDepth}-bit)`);
+    if (c.battery) summaryLines.push(`• Battery: ${Math.round((c.battery.level ?? 0)*100)}% • ${c.battery.charging ? '⚡ charging' : 'idle'}`);
+    if (c.color) summaryLines.push(`• Color scheme: ${c.color.scheme || '-'}`);
+
+    // Build debug JSON snippet (headers + body), trimmed
+    const debug = {
+      headers: h || {},
+      body: item.lastBody || {},
+      rawUa: ua,
+      q: q || {}
+    };
+    let debugStr = safeJson(debug);
+    debugStr = trimStr(debugStr, MAX_JSON_SNIPPET);
+
+    // Compose Discord payload - human summary + code block debug
+    const discordContent = summaryLines.join('\n') + '\n\n' + '```json\n' + debugStr + '\n```';
+
+    // send safely
+    try {
+      await fetch(webhook, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: discordContent })
+      });
+    } catch (err) {
+      console.error('alert webhook send error', err && err.stack || err);
+    }
+
+    // mark to avoid immediate re-alert: keep entry timestamp, but clear the timer
+    clearTimeout(item.timer);
+    // update firstTs to lastTs so re-alert won't happen until DEDUPE_HOLD_MS later
+    item.firstTs = Date.now();
+    // schedule removal after DEDUPE_HOLD_MS
+    setTimeout(() => store.delete(key), DEDUPE_HOLD_MS);
+  }
 };
