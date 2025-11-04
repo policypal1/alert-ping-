@@ -1,7 +1,7 @@
-<script>
-/* Lightweight client tracker
-   - Prompts once for tester name, stores in localStorage + cookie
-   - Gathers basic device/network info
+/* public/tracker.js
+   - Prompts once for tester name (consent)
+   - Stores name in localStorage + cookie (so server can read it)
+   - Gathers lightweight device details
    - Sends a POST to /api/alert on page load
 */
 (function(){
@@ -15,14 +15,13 @@
   function getName(){
     let n = localStorage.getItem(KEY);
     if (!n) {
-      n = prompt('Tester name for logs?'); // consent prompt for your test group
+      n = prompt('Tester name for logs?'); // visible consent for your test group
       if (n) {
         localStorage.setItem(KEY, n);
-        setCookie('name', n, 365); // also expose via cookie so GET hits can read it
+        setCookie('name', n, 365);
       }
     } else {
-      // keep cookie fresh
-      setCookie('name', n, 365);
+      setCookie('name', n, 365); // keep cookie fresh
     }
     return n || null;
   }
@@ -34,7 +33,7 @@
       path: location.pathname,
       language: navigator.language || null,
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
-      color: { scheme: matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light' },
+      color: { scheme: (matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light' },
       screen: { w: screen.width, h: screen.height, colorDepth: screen.colorDepth },
       hw: { cores: navigator.hardwareConcurrency || null, memoryGB: navigator.deviceMemory || null },
       net: (navigator.connection ? { type: navigator.connection.effectiveType, downlink: navigator.connection.downlink } : null),
@@ -75,4 +74,3 @@
   if (document.readyState === 'complete') collect();
   else addEventListener('load', collect);
 })();
-</script>
